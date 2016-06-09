@@ -176,11 +176,11 @@ void draw_bars(int pos,CRGB C1, CRGB C2, CRGB C3){
 //Bleep out over the motor (1047,1396,2093) may work well
 void beep_motor(int f1, int f2, int f3){
   analogWrite(MOTPIN, 20); //Some value low enough so that the motor does not spin
-  analogWriteFrequency(f1);
+  analogWriteFrequency(MOTPIN, f1);
   delay(150);
-  analogWriteFrequency(f2);
+  analogWriteFrequency(MOTPIN, f2);
   delay(150);
-  analogWriteFrequency(f3);
+  analogWriteFrequency(MOTPIN, f3);
   delay(150);
 }
 
