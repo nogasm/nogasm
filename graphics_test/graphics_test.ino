@@ -10,10 +10,10 @@
 #define LED_PIN 17 //5V buffered pin on Teensy LC, single wire data out to WS8212Bs
 #define LED_TYPE    WS2812B
 #define COLOR_ORDER GRB
-#define BRIGHTNESS 80 //Subject to change, limits current that the LEDs draw
+#define BRIGHTNESS 255 //Subject to change, limits current that the LEDs draw
 
 //Encoder
-#define REDPIN   5
+#define REDPIN   5 //RGB pins of the encoder LED
 #define GREENPIN 4
 #define BLUEPIN  3
 #define ENC_SW   6 //Pushbutton on the encoder
@@ -33,13 +33,13 @@ Encoder myEnc(8, 7); //Quadrature inputs on pins 7,8
 
 //=======Software/Timing options=====================
 #define FREQUENCY 60 //Update frequency in Hz
-#define LONG_PRESS_MS 2000
+#define LONG_PRESS_MS 2000 //ms requirements for a long press
 
 //Update/render period
 #define period (1000/FREQUENCY)
 #define longBtnCount (LONG_PRESS_MS / period)
 
-//Running pressure average length and update frequency
+//Running pressure average array length and update frequency
 #define RA_HIST_SECONDS 25
 #define RA_FREQUENCY 6
 #define RA_TICK_PERIOD (FREQUENCY / RA_FREQUENCY)
@@ -55,6 +55,7 @@ RunningAverage raPressure(RA_FREQUENCY*RA_HIST_SECONDS);
 #define SAVE        7
 #define RESET       8
 
+uint8_t state = MANUAL;
 //=======Global Variables=============================
 //DIP switch options:
 bool SERIAL_EN =  false;
@@ -104,6 +105,7 @@ void setup() {
   delay(3000); // 3 second delay for recovery
 
   //If a pin reads low, the switch is enabled. Here, we read in the DIP settings
+  //Right now, only SW1 is used, for en/disabling serial.
   SERIAL_EN = (digitalRead(SW1PIN) == LOW);
   SW2 = (digitalRead(SW2PIN) == LOW);
   SW3 = (digitalRead(SW3PIN) == LOW);
@@ -159,16 +161,19 @@ void draw_bars(int pos,CRGB C1, CRGB C2, CRGB C3){
   int barPos = pos % NUM_LEDS;
   switch(colorNum){
     case 0:
-      fill_solid(leds, NUM_LEDS, CHSV(0,0,0)); //black background
-      fill_solid(leds, barPos, C1);
+      //fill_solid(leds, NUM_LEDS, CHSV(0,0,0)); //black background
+      //fill_solid(leds, barPos, C1);
+      leds[barPos] = C1;
       break;
     case 1:
-      fill_solid(leds, NUM_LEDS, C1);
-      fill_solid(leds, barPos, C2);
+      //fill_solid(leds, NUM_LEDS, C1);
+      //fill_solid(leds, barPos, C2);
+      leds[barPos] = C2;
       break;
     case 2:
-      fill_solid(leds, NUM_LEDS, C2);
-      fill_solid(leds, barPos, C3);
+      //fill_solid(leds, NUM_LEDS, C2);
+      //fill_solid(leds, barPos, C3);
+      leds[barPos] = C3;
       break;
   }
 }
@@ -195,8 +200,10 @@ void loop() {
     CRGB green = CRGB::Green;
     CRGB yellow = CRGB::Yellow;
 
+    //leds[pos/4] = green;
+    fadeToBlackBy(leds,NUM_LEDS,20);
     
-    draw_cursor(pos,green,yellow,red);
+    draw_cursor(pos/4,green,yellow,red);
     FastLED.show();
   }
 
