@@ -180,33 +180,39 @@ void draw_bars(int pos,CRGB C1, CRGB C2, CRGB C3){
 
 //Bleep out over the motor (1047,1396,2093) may work well
 void beep_motor(int f1, int f2, int f3){
-  analogWrite(MOTPIN, 20); //Some value low enough so that the motor does not spin
+  analogWrite(MOTPIN, 10); //Some value low enough so that the motor does not spin
   analogWriteFrequency(MOTPIN, f1);
-  delay(150);
+  delay(250);
   analogWriteFrequency(MOTPIN, f2);
-  delay(150);
+  delay(250);
   analogWriteFrequency(MOTPIN, f3);
-  delay(150);
+  delay(250);
 }
-
+int pos = 0;
 //=======Main Loop=============================
 void loop() {
   //Run everything at the update frequency
   if (millis() % period == 0) {
     //Serial.print(state);
     delay(1);
-    int pos = myEnc.read();
+    
+    pos = myEnc.read();
     CRGB red = CRGB::Red;
     CRGB green = CRGB::Green;
     CRGB yellow = CRGB::Yellow;
+    CRGB purple = CRGB::Purple;
 
     //leds[pos/4] = green;
     fadeToBlackBy(leds,NUM_LEDS,20);
     
-    draw_cursor(pos/4,green,yellow,red);
+    
     FastLED.show();
+    //beep_motor(1047,1396,2093);
+    //delay(1000);
   }
-
+  pressure = analogRead(BUTTPIN) - pOffset;
+  draw_cursor(pos/4,CRGB::LightBlue,CRGB::Blue,CRGB::Purple);
+  draw_cursor(pressure,CRGB::Green,CRGB::Yellow,CRGB::Red);
 
 
 

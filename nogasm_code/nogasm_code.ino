@@ -1,6 +1,48 @@
-// Feb 2016 - nogasm
+// Jul 2016 - Nogasm Code Rev. 3
+/* Drives a vibrator and uses changes in pressure of an inflatable buttplug
+ * to estimate a user's closeness to orgasm, and turn off the vibrator
+ * before that point.
+ * A state machine updating at 60Hz creates different modes and option menus
+ * that can be identified by the color of the LEDs, especially the RGB LED
+ * in the central button/encoder knob.
+ * 
+ * [Red]    Manual Vibrator Control
+ * [Blue]   Automatic vibrator edging, knob adjusts orgasm detection sensitivity
+ * [Green]  Setting menu for maximum vibrator speed in automatic mode
+ * [White]  Debubbing menu to show data from the pressure sensor ADC
+ * [Off]    While still plugged in, holding the button down for >3 seconds turns
+ *          the whole device off, until the button is pressed again.
+ * 
+ * Settings like edging sensitivity, or maximum motor speed are stored in EEPROM,
+ * so they are saved through power-cycling.
+ * 
+ * In the automatic edging mode, the vibrator speed will linearly ramp up to full
+ * speed (set in the green menu) over 30 seconds. If a near-orgasm is detected,
+ * the vibrator abruptly turns off for 15 seconds, then begins ramping up again.
+ * 
+ * The motor will beep during power on/off, and if the plug pressure rises above
+ * the maximum the board can read - this condition could lead to a missed orgasm 
+ * if unchecked. The analog gain for the sensor is adjustable via a trimpot to
+ * accomidate different types of plugs that have higher/lower resting pressures.
+ * 
+ * Motor speed, current pressure, and average pressure are reported via USB serial
+ * at 115200 baud. Timestamps can also be enabled, from the main loop.
+ * 
+ * There is some framework for more features like an adjustable "cool off" time 
+ * other than the default 15 seconds, and options for LED brightness and enabling/
+ * disabling beeps. Four DIP switches are included on the board to allow users to
+ * change other software settings without reflashing code. One example use would 
+ * be switch 1 toggling between the defaul ramping motor behavior, and a strict
+ * ON/OFF output to the motor that could instead be used to toggle a relay for 
+ * driving other toys.
+ * 
+ * Note - Do not set all 13 LEDs to white at full brightness at once 
+ * (RGB 255,255,255) It may overheat the voltage regulator and cause the board 
+ * to reset.
+ */
 //=======Libraries===============================
 #include <Encoder.h>
+#include <EEPROM.h>
 #include "FastLED.h"
 #include "RunningAverage.h"
 
@@ -10,10 +52,10 @@
 #define LED_PIN 17 //5V buffered pin on Teensy LC, single wire data out to WS8212Bs
 #define LED_TYPE    WS2812B
 #define COLOR_ORDER GRB
-#define BRIGHTNESS 80 //Subject to change, limits current that the LEDs draw
+#define BRIGHTNESS 255 //Subject to change, limits current that the LEDs draw
 
 //Encoder
-#define REDPIN   5
+#define REDPIN   5 //RGB pins of the encoder LED
 #define GREENPIN 4
 #define BLUEPIN  3
 #define ENC_SW   6 //Pushbutton on the encoder
@@ -33,17 +75,19 @@ Encoder myEnc(8, 7); //Quadrature inputs on pins 7,8
 
 //=======Software/Timing options=====================
 #define FREQUENCY 60 //Update frequency in Hz
-#define LONG_PRESS_MS 2000
+#define LONG_PRESS_MS 600 //ms requirements for a long press, to move to option menus
+#define V_LONG_PRESS_MS 2500 //ms for a very long press, which turns the device off
 
 //Update/render period
 #define period (1000/FREQUENCY)
 #define longBtnCount (LONG_PRESS_MS / period)
 
-//Running pressure average length and update frequency
+//Running pressure average array length and update frequency
 #define RA_HIST_SECONDS 25
 #define RA_FREQUENCY 6
 #define RA_TICK_PERIOD (FREQUENCY / RA_FREQUENCY)
 RunningAverage raPressure(RA_FREQUENCY*RA_HIST_SECONDS);
+int sensitivity = 0; //orgasm detection sensitivity, persists through different states
 
 //=======State Machine Modes=========================
 #define MANUAL      1
@@ -52,10 +96,17 @@ RunningAverage raPressure(RA_FREQUENCY*RA_HIST_SECONDS);
 #define OPT_RAMPSPD 4
 #define OPT_BEEP    5
 #define OPT_PRES    6
-#define SAVE        7
-#define RESET       8
 
-//=======Global Variables=============================
+
+//Button states - no press, short press, long press
+#define BTN_NONE   0
+#define BTN_SHORT  1
+#define BTN_LONG   2
+#define BTN_V_LONG 3
+
+
+uint8_t state = MANUAL;
+//=======Global Settings=============================
 //DIP switch options:
 bool SERIAL_EN =  false;
 bool SW2 =        false;
@@ -63,366 +114,381 @@ bool SW3 =        false;
 bool SW4 =        false;
 
 CRGB leds[NUM_LEDS];
-int cursorLed = 0;
 
-int oldEnc = 0; //previously observed encoder position
-int newEnc = 0;
-int encPos = 0;
-bool btnPress = 0;
-int longPress = 0;
 int pressure = 0;
-int avgPressure = 0;
-int bri =100;
-const int pOffset = analogRead(BUTTPIN);
-int rampTimeS = 30;
-int pLimit = 300;
+int avgPressure = 0; //Running 25 second average pressure
+//int bri =100; //Brightness setting
+int rampTimeS = 30; //Ramp-up time, in seconds
+#define DEFAULT_PLIMIT 600
+int pLimit = DEFAULT_PLIMIT; //Limit in change of pressure before the vibrator turns off
+int maxSpeed = 255; //maximum speed the motor will ramp up to in automatic mode
+float motSpeed = 0; //Motor speed, 0-255 (float to maintain smooth ramping to low speeds)
+
+//=======EEPROM Addresses============================
+//128b available on teensy LC
+#define BEEP_ADDR         1
+#define MAX_SPEED_ADDR    2
+#define SENSITIVITY_ADDR  3
+//#define RAMPSPEED_ADDR    4 //For now, ramp speed adjustments aren't implemented
+
 //=======Setup=======================================
+//Beep out tones over the motor by frequency (1047,1396,2093) may work well
+void beep_motor(int f1, int f2, int f3){
+  if(motSpeed > 245) analogWrite(MOTPIN, 245); //make sure the frequency is audible
+  else if(motSpeed < 10) analogWrite(MOTPIN, 10);
+  analogWriteFrequency(MOTPIN, f1);
+  delay(250);
+  analogWriteFrequency(MOTPIN, f2);
+  delay(250);
+  analogWriteFrequency(MOTPIN, f3);
+  delay(250);
+  analogWriteFrequency(MOTPIN, 440);
+  analogWrite(MOTPIN,motSpeed);
+}
+
 void setup() {
-  pinMode(REDPIN,   OUTPUT);
+  pinMode(REDPIN,   OUTPUT); //Connected to RGB LED in the encoder
   pinMode(GREENPIN, OUTPUT);
   pinMode(BLUEPIN,  OUTPUT);
-  pinMode(ENC_SW,   INPUT);
+  pinMode(ENC_SW,   INPUT); //Pin to read quadrature pulses from encoder
 
-  //Set DIP switch pins as inputs
-  pinMode(SW1PIN,   INPUT);
+  pinMode(SW1PIN,   INPUT); //Set DIP switch pins as inputs
   pinMode(SW2PIN,   INPUT);
   pinMode(SW3PIN,   INPUT);
   pinMode(SW4PIN,   INPUT);
 
-  //Enable pullup resistors on DIP pins. They are tied to GND if enabled.
-  digitalWrite(SW1PIN, HIGH);
-  digitalWrite(SW2PIN, HIGH);
+  digitalWrite(SW1PIN, HIGH); //Enable pullup resistors on DIP switch pins.
+  digitalWrite(SW2PIN, HIGH); //They are tied to GND when switched on.
   digitalWrite(SW3PIN, HIGH);
   digitalWrite(SW4PIN, HIGH);
 
-  pinMode(MOTPIN,   OUTPUT); //Might want uh, analog out? PWM at some frequency.
-  pinMode(BUTTPIN,  INPUT);
+  pinMode(MOTPIN,OUTPUT); //Enable "analog" out (PWM)
+  
+  pinMode(BUTTPIN,INPUT); //default is 10 bit resolution (1024), 0-3.3
+  analogReadRes(12); //changing ADC resolution to 12 bits (4095)
+  analogReadAveraging(32); //To reduce noise, average 32 samples each read.
+  
   raPressure.clear(); //Initialize a running pressure average
-  //Make sure the motor is off
-  digitalWrite(MOTPIN, LOW);
+
+  digitalWrite(MOTPIN, LOW);//Make sure the motor is off
 
   delay(3000); // 3 second delay for recovery
 
   //If a pin reads low, the switch is enabled. Here, we read in the DIP settings
+  //Right now, only SW1 is used, for en/disabling serial. Though, it's enabled anyway
   SERIAL_EN = (digitalRead(SW1PIN) == LOW);
   SW2 = (digitalRead(SW2PIN) == LOW);
   SW3 = (digitalRead(SW3PIN) == LOW);
   SW4 = (digitalRead(SW4PIN) == LOW);
 
-  if (SERIAL_EN) {
-    Serial.begin(115200);
-  }
+  Serial.begin(115200);
 
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
-  // limit my draw to .6A at 5v of power draw
-  //FastLED.setMaxPowerInVoltsAndMilliamps(5,600);
+  // limit power draw to .6A at 5v... Didn't seem to work in my FastLED version though
+  //FastLED.setMaxPowerInVoltsAndMilliamps(5,DEFAULT_PLIMIT);
   FastLED.setBrightness(BRIGHTNESS);
+
+  //Recall saved settings from memory
+  sensitivity = EEPROM.read(SENSITIVITY_ADDR);
+  maxSpeed = EEPROM.read(MAX_SPEED_ADDR);
+  beep_motor(1047,1396,2093); //Power on beep
 }
 
-//=======Helper Functions=============================
+//=======LED Drawing Functions=================
 
-
-//Fade all LEDs to 200/255 their previous value
-void fadeall() {
-  for (int i = 0; i < NUM_LEDS; i++) {
-    leds[i].nscale8(245);
-  }
-}
-
-void drawCursor(int value, int minVal, int maxVal) {
-
-  cursorLed = constrain(encPos / 4, 0, NUM_LEDS - 1);
-}
-
-void showAnalogRGB(const CRGB& rgb)
+void showKnobRGB(const CRGB& rgb)
 {
   analogWrite(REDPIN,   rgb.r );
   analogWrite(GREENPIN, rgb.g );
   analogWrite(BLUEPIN,  rgb.b );
 }
 
-void gyrGraphDraw(int val, int minVal, int maxVal) {
-  val = constrain(val, minVal, maxVal);
-  int revSize = maxVal / 3;
-  int barPos = constrain(map(val % revSize, 0, revSize, 0, NUM_LEDS), 0, NUM_LEDS - 1);
-  //int nextPosInterpol = (revSize/NUM_LEDS)-(val % (revSize/NUM_LEDS));
-  //int nextPosInterpol = map(val % (maxVal/(3*NUM_LEDS)),0,(maxVal/(3*NUM_LEDS)),25,150);
-  int revsAlready = (3 * val) / maxVal;
-
-  switch (revsAlready) {
-    case 2:
-      fill_solid(leds, NUM_LEDS, CHSV(45, 255, bri)); //Yellow Background
-      fill_solid(leds, barPos, CHSV(0, 255, bri)); //Red Bar
-      //showAnalogRGB(CHSV(45,255,bri)); //Make knob Yellow
-      break;
-
-
-    //Or, if val is > 1/3 max, make background green
-    case 1:
-      fill_solid(leds, NUM_LEDS, CHSV(85, 255, bri)); //Green background
-      fill_solid(leds, barPos, CHSV(45, 255, bri)); //Yellow Bar
-      //showAnalogRGB(CHSV(85,255,bri)); //Make knob Green
-      break;
-
-    //Otherwise, just a dim white backgorund
+//Draw a "cursor", one pixel representing either a pressure or encoder position value
+//C1,C2,C3 are colors for each of 3 revolutions over the 13 LEDs (39 values)
+void draw_cursor_3(int pos,CRGB C1, CRGB C2, CRGB C3){
+  pos = constrain(pos,0,NUM_LEDS*3-1);
+  int colorNum = pos/NUM_LEDS; //revolution number
+  int cursorPos = pos % NUM_LEDS; //place on circle, from 0-12
+  switch(colorNum){
     case 0:
-      fill_solid(leds, NUM_LEDS, CHSV(0, 0, bri)); //white back
-      fill_solid(leds, barPos, CHSV(85, 255, bri)); //Green Bar
-      //leds[barPos] = CHSV(85,255,nextPosInterpol); Tried to do fading, probably a bad idea
-      //showAnalogRGB(CHSV(60,255,bri)); //Make knob White
+      leds[cursorPos] = C1;
       break;
-    default:
-      fill_solid(leds, NUM_LEDS, CHSV(45, 255, bri)); //Yellow Background
-      fill_solid(leds, NUM_LEDS, CHSV(0, 255, bri)); //Red Bar
-      //showAnalogRGB(CHSV(45,255,bri)); //Make knob Yellow
-      break;
-    
-  }
-
-}
-
-void cursorDraw(int val, int maxVal, int revs) {
-  int revSize = maxVal / revs;
-  int cursorPos = constrain(map(val % revSize, 0, revSize, 0, NUM_LEDS), 0, NUM_LEDS - 1);
-  //int nextPosInterpol = (revSize/NUM_LEDS)-(val % (revSize/NUM_LEDS));
-  //int nextPosInterpol = map(val % (maxVal/(3*NUM_LEDS)),0,(maxVal/(3*NUM_LEDS)),25,150);
-  int revsAlready = (revs * val) / maxVal;
-
-  switch (revsAlready) {
-    case 2:
-      leds[cursorPos] = CRGB(220, 0, 255); //Purple
-      showAnalogRGB(CRGB(220, 0, 255)); //Color the knob, too.
-      break;
-
-
-    //Or, if val is > 1/3 max, make background green
     case 1:
-      leds[cursorPos] = CHSV(HUE_BLUE, 255, 255); //Blue
-      showAnalogRGB(CHSV(HUE_BLUE, 255, 255)); //Make knob Green
+      leds[cursorPos] = C2;
       break;
-
-    //Otherwise, just a dim white backgorund
-    case 0:
-      leds[cursorPos] = CHSV(HUE_AQUA, 200, 255); //light blue
-      showAnalogRGB(CHSV(HUE_AQUA, 255, 255)); //Make knob White
+    case 2:
+      leds[cursorPos] = C3;
       break;
   }
-
 }
 
-
-void colorBars()
-{
-  showAnalogRGB( CRGB::Red );   delay(2000);
-  showAnalogRGB( CRGB::Green ); delay(2000);
-  showAnalogRGB( CRGB::Blue );  delay(2000);
-  showAnalogRGB( CRGB::Black ); delay(2000);
+//Draw a "cursor", one pixel representing either a pressure or encoder position value
+void draw_cursor(int pos,CRGB C1){
+  pos = constrain(pos,0,NUM_LEDS-1);
+  leds[pos] = C1;
 }
+
+//Draw 3 revolutions of bars around the LEDs. From 0-39, 3 colors
+void draw_bars_3(int pos,CRGB C1, CRGB C2, CRGB C3){
+  pos = constrain(pos,0,NUM_LEDS*3-1);
+  int colorNum = pos/NUM_LEDS; //revolution number
+  int barPos = pos % NUM_LEDS; //place on circle, from 0-12
+  switch(colorNum){
+    case 0:
+      fill_gradient_RGB(leds,0,C1,barPos,C1);
+      //leds[barPos] = C1;
+      break;
+    case 1:
+      fill_gradient_RGB(leds,0,C1,barPos,C2);
+      break;
+    case 2:
+      fill_gradient_RGB(leds,0,C2,barPos,C3);
+      break;
+  }
+}
+
+//Provide a limited encoder reading corresponting to tacticle clicks on the knob.
+//Each click passes through 4 encoder pulses. This reduces it to 1 pulse per click
+int encLimitRead(int minVal, int maxVal){
+  if(myEnc.read()>maxVal*4)myEnc.write(maxVal*4);
+  else if(myEnc.read()<minVal*4) myEnc.write(minVal*4);
+  return constrain(myEnc.read()/4,minVal,maxVal);
+}
+
 //=======Program Modes/States==================
 
-
-void run_manual(int lastState) {
-  //Serial.println("Manual");
-  static int knobOffset = 0;
-
-  if (lastState != MANUAL) {
-    knobOffset = myEnc.read();
-  }
+// Manual vibrator control mode (red), still shows orgasm closeness in background
+void run_manual() {
   //In manual mode, only allow for 13 cursor positions, for adjusting motor speed.
-  int knob = constrain((myEnc.read() - knobOffset), 0, 4 * (NUM_LEDS - 1));
-  int motSpeed = map(knob, 0, 4 * NUM_LEDS, 0, 255);
+  int knob = encLimitRead(0,12);
+  motSpeed = map(knob, 0, 12, 0., 255.);
   analogWrite(MOTPIN, motSpeed);
 
   //gyrGraphDraw(avgPressure, 0, 4 * 3 * NUM_LEDS);
-  gyrGraphDraw(constrain(pressure - avgPressure, 0, pLimit), 0, pLimit);
-  cursorDraw(knob, 4 * NUM_LEDS, 1);
-  //Serial.print("pressure:");
-  //Serial.println(pressure);
-  //Serial.println(knob);
-
+  int presDraw = map(constrain(pressure - avgPressure, 0, pLimit),0,pLimit,0,NUM_LEDS*3);
+  draw_bars_3(presDraw, CRGB::Green,CRGB::Yellow,CRGB::Red);
+  draw_cursor(knob, CRGB::Red);
 }
 
-void run_auto(int lastState) {
-  static int knobOffset = 0;
-  static float motSpeed = 0;
+// Automatic edging mode, knob adjust sensitivity.
+void run_auto() {
   static float motIncrement = 0.0;
-  //Serial.println("Auto");
-  if (lastState != AUTO) {
-    knobOffset = myEnc.read();
-    motSpeed = 0.0;
-    motIncrement = (255.0 / ((float)FREQUENCY * (float)rampTimeS));
-  }
+  motIncrement = ((float)maxSpeed / ((float)FREQUENCY * (float)rampTimeS));
 
-  int knob = constrain((myEnc.read() - knobOffset), 0, 4 * 3 * (NUM_LEDS - 1));
+  int knob = encLimitRead(0,(3*NUM_LEDS)-1);
+  sensitivity = knob*4; //Save the setting if we leave and return to this state
   //Reverse "Knob" to map it onto a pressure limit, so that it effectively adjusts sensitivity
-  pLimit = map(knob, 0, 4 * 3 * (NUM_LEDS - 1), 300, 0); //300 is max sensitivity change
+  pLimit = map(knob, 0, 3 * (NUM_LEDS - 1), 600, 1); //set the limit of delta pressure before the vibrator turns off
   //When someone clenches harder than the pressure limit
   if (pressure - avgPressure > pLimit) {
-    motSpeed = -156.; //Stay off for a while (half the ramp up time)
-    analogWrite(MOTPIN, (int) motSpeed);
+    motSpeed = -.5*(float)rampTimeS*((float)FREQUENCY*motIncrement);//Stay off for a while (half the ramp up time)
   }
-  else if (motSpeed < 255) {
+  else if (motSpeed < (float)maxSpeed) {
     motSpeed += motIncrement;
-    analogWrite(MOTPIN, (int) motSpeed);
   }
-  Serial.println(motSpeed);
+  analogWrite(MOTPIN, (int) motSpeed);
 
-
-  gyrGraphDraw(constrain(pressure - avgPressure, 0, pLimit), 0, pLimit);
-  cursorDraw(knob, 4 * 3 * NUM_LEDS, 3);
+  int presDraw = map(constrain(pressure - avgPressure, 0, pLimit),0,pLimit,0,NUM_LEDS*3);
+  draw_bars_3(presDraw, CRGB::Green,CRGB::Yellow,CRGB::Red);
+  draw_cursor_3(knob, CRGB(50,50,200),CRGB::Blue,CRGB::Purple);
 
 }
 
-void run_opt_speed(int lastState) {
-  Serial.println("speed");
+//Setting menu for adjusting the maximum vibrator speed automatic mode will ramp up to
+void run_opt_speed() {
+  Serial.println("speed settings");
+  int knob = encLimitRead(0,12);
+  motSpeed = map(knob, 0, 12, 0., 255.);
+  analogWrite(MOTPIN, motSpeed);
+  maxSpeed = motSpeed; //Set the maximum ramp-up speed in automatic mode
+  //Little animation to show ramping up on the LEDs
+  static int visRamp = 0;
+  if(visRamp <= FREQUENCY*NUM_LEDS-1) visRamp += 16;
+  else visRamp = 0;
+  draw_bars_3(map(visRamp,0,(NUM_LEDS-1)*FREQUENCY,0,knob),CRGB::Green,CRGB::Green,CRGB::Green);
 }
 
-void run_opt_rampspd(int lastState) {
+//Not yet added, but adjusts how quickly the vibrator turns back on after being triggered off
+void run_opt_rampspd() {
   Serial.println("rampSpeed");
 }
 
-void run_opt_beep(int lastState) {
-  Serial.println("Brightness");
+//Also not completed, option for enabling/disabling beeps
+void run_opt_beep() {
+  Serial.println("Brightness Settings");
 }
 
-void run_opt_pres(int lastState) {
-  Serial.println("Brightness");
+//Simply display the pressure analog voltage. Useful for debugging sensitivity issues.
+void run_opt_pres() {
+  int p = map(analogRead(BUTTPIN),0,4095,0,NUM_LEDS-1);
+  draw_cursor(p,CRGB::White);
 }
 
-void run_save(int lastState) {
-  Serial.println("Save");
+//Poll the knob click button, and check for long/very long presses as well
+uint8_t check_button(){
+  static bool lastBtn = LOW;
+  static unsigned long keyDownTime = 0;
+  uint8_t btnState = BTN_NONE;
+  bool thisBtn = digitalRead(ENC_SW);
+
+  //Detect single presses, no repeating, on keyup
+  if(thisBtn == HIGH && lastBtn == LOW){
+    keyDownTime = millis();
+  }
+  
+  if (thisBtn == LOW && lastBtn == HIGH) { //there was a keyup
+    if((millis()-keyDownTime) >= V_LONG_PRESS_MS){
+      btnState = BTN_V_LONG;
+    }
+    else if((millis()-keyDownTime) >= LONG_PRESS_MS){
+      btnState = BTN_LONG;
+      }
+    else{
+      btnState = BTN_SHORT;
+      }
+    }
+
+  lastBtn = thisBtn;
+  return btnState;
 }
 
-void run_reset(int lastState) {
-  Serial.println("Reset");
+//run the important/unique parts of each state. Also, set button LED color.
+void run_state_machine(uint8_t state){
+  switch (state) {
+      case MANUAL:
+        showKnobRGB(CRGB::Red);
+        run_manual();
+        break;
+      case AUTO:
+        showKnobRGB(CRGB::Blue);
+        run_auto();
+        break;
+      case OPT_SPEED:
+        showKnobRGB(CRGB::Green);
+        run_opt_speed();
+        break;
+      case OPT_RAMPSPD:
+        showKnobRGB(CRGB::Yellow);
+        run_opt_rampspd();
+        break;
+      case OPT_BEEP:
+        showKnobRGB(CRGB::Purple);
+        run_opt_beep();
+        break;
+      case OPT_PRES:
+        showKnobRGB(CRGB::White);
+        run_opt_pres();
+        break;
+      default:
+        run_manual();
+        break;
+    }
+}
+
+//Switch between state machine states, and reset the encoder position as necessary
+//Returns the next state to run. Very long presses will turn the system off (sort of)
+uint8_t set_state(uint8_t btnState, uint8_t state){
+  if(btnState == BTN_NONE){
+    return state;
+  }
+  if(btnState == BTN_V_LONG){
+    //Turn the device off until woken up by the button
+    Serial.println("power off");
+    fill_gradient_RGB(leds,0,CRGB::Black,NUM_LEDS-1,CRGB::Black);//Turn off LEDS
+    FastLED.show();
+    showKnobRGB(CRGB::Black);
+    analogWrite(MOTPIN, 0);
+    beep_motor(2093,1396,1047);
+    analogWrite(MOTPIN, 0); //Turn Motor off
+    while(!digitalRead(ENC_SW))delay(1);
+    beep_motor(1047,1396,2093);
+    return MANUAL ;
+  }
+  else if(btnState == BTN_SHORT){
+    switch(state){
+      case MANUAL:
+        myEnc.write(sensitivity);//Whenever going into auto mode, keep the last sensitivity
+        motSpeed = 0; //Also reset the motor speed to 0
+        return AUTO;
+      case AUTO:
+        myEnc.write(0);//Whenever going into manual mode, set the speed to 0.
+        motSpeed = 0;
+        EEPROM.update(SENSITIVITY_ADDR, sensitivity);
+        return MANUAL;
+      case OPT_SPEED:
+        myEnc.write(0);
+        EEPROM.update(MAX_SPEED_ADDR, maxSpeed);
+        //return OPT_RAMPSPD;
+        //return OPT_BEEP;
+        analogWrite(MOTPIN, 0); //Turn the motor off for the white pressure monitoring mode
+        return OPT_PRES; //Skip beep and rampspeed settings for now
+      case OPT_RAMPSPD: //Not yet implimented
+        //motSpeed = 0;
+        //myEnc.write(0);
+        return OPT_BEEP;
+      case OPT_BEEP:
+        myEnc.write(0);
+        return OPT_PRES;
+      case OPT_PRES:
+        myEnc.write(map(maxSpeed,0,255,0,4*(NUM_LEDS)));//start at saved value
+        return OPT_SPEED;
+    }
+  }
+  else if(btnState == BTN_LONG){
+    switch (state) {
+          case MANUAL:
+            myEnc.write(map(maxSpeed,0,255,0,4*(NUM_LEDS)));//start at saved value
+            return OPT_SPEED;
+          case AUTO:
+            myEnc.write(map(maxSpeed,0,255,0,4*(NUM_LEDS)));//start at saved value
+            return OPT_SPEED;
+          case OPT_SPEED:
+            myEnc.write(0);
+            return MANUAL;
+          case OPT_RAMPSPD:
+            return MANUAL;
+          case OPT_BEEP:
+            return MANUAL;
+          case OPT_PRES:
+            myEnc.write(0);
+            return MANUAL;
+        }
+  }
+  else return MANUAL;
 }
 
 //=======Main Loop=============================
 void loop() {
-  static uint8_t hue = 0;
-  //showAnalogRGB( CHSV( hue, 255, 255) );
-
-  static int state = 1;
-  static int lastState = 0;
-  static int thisBtn = 0;
-  static int lastBtn = 0;
-  static int btnCount = 0;
-  static int longBtnPress = 0;
-  static int tick = 0;
-
-  //Run everything at the update frequency
+  static uint8_t state = MANUAL;
+  static int sampleTick = 0;
+  //Run this section at the update frequency (default 60 Hz)
   if (millis() % period == 0) {
-    //Serial.print(state);
     delay(1);
-    pressure = analogRead(BUTTPIN) - pOffset;
-    tick ++;
-    if (tick % RA_TICK_PERIOD == 0) {
+    
+    sampleTick++; //Add pressure samples to the running average slower than 60Hz
+    if (sampleTick % RA_TICK_PERIOD == 0) {
       raPressure.addValue(pressure);
       avgPressure = raPressure.getAverage();
     }
-    thisBtn = digitalRead(ENC_SW);
+    
+    pressure = analogRead(BUTTPIN);
+    fadeToBlackBy(leds,NUM_LEDS,20); //Create a fading light effect. LED buffer is not otherwise cleared
+    uint8_t btnState = check_button();
+    state = set_state(btnState,state); //Set the next state based on this state and button presses
+    run_state_machine(state);
+    FastLED.show(); //Update the physical LEDs to match the buffer in software
 
-    //Detect single presses, no repeating, on keyup
-    if (thisBtn == LOW && lastBtn == HIGH) {
-      btnPress = true;
-    }
-    else {
-      btnPress = false;
-    }
+    //Alert that the Pressure voltage amplifier is railing, and the trim pot needs to be adjusted
+    if(pressure > 4030)beep_motor(2093,2093,2093); //Three high beeps
 
-    //Detect long presses (as defined in timing section)
-    if (thisBtn == HIGH) {
-      btnCount ++;
-    }
-    lastBtn = thisBtn;
+    //Report pressure and motor data over USB for analysis / other uses. timestamps disabled by default
+    //Serial.print(millis()); //Timestamp (ms)
+    //Serial.print(",");
+    Serial.print(motSpeed); //Motor speed (0-255)
+    Serial.print(",");
+    Serial.print(pressure); //(Original ADC value - 12 bits, 0-4095)
+    Serial.print(",");
+    Serial.println(avgPressure); //Running average of (default last 25 seconds) pressure
 
-    //switch states when button is pressed
-    if (btnPress) {
-      switch (state) {
-        case MANUAL:
-          state = AUTO;
-          break;
-        case AUTO:
-          state = MANUAL;
-          break;
-        case OPT_SPEED:
-          state = OPT_RAMPSPD;
-          break;
-        case OPT_RAMPSPD:
-          state = OPT_BEEP;
-          break;
-        case OPT_BEEP:
-          state = OPT_PRES;
-          break;
-        case OPT_PRES:
-          state = OPT_SPEED;
-          break;
-      }
-      //Given that there's a keyup, was it a long press?
-      if (btnCount >= longBtnCount) {
-        switch (state) {
-          case MANUAL:
-            state = OPT_SPEED;
-            break;
-          case AUTO:
-            state = OPT_SPEED;
-            break;
-          case OPT_SPEED:
-            state = SAVE;
-            break;
-          case OPT_RAMPSPD:
-            state = SAVE;
-            break;
-          case OPT_BEEP:
-            state = SAVE;
-            break;
-          case OPT_PRES:
-            state = SAVE;
-            break;
-        }
-      }
-      btnCount = 0;
-    }
-
-    //Run in the selected state
-    switch (state) {
-      case MANUAL:
-        run_manual(lastState);
-        break;
-      case AUTO:
-        run_auto(lastState);
-        break;
-      case OPT_SPEED:
-        run_opt_speed(lastState);
-        break;
-      case OPT_RAMPSPD:
-        run_opt_rampspd(lastState);
-        break;
-      case OPT_BEEP:
-        run_opt_beep(lastState);
-        break;
-      case OPT_PRES:
-        run_opt_pres(lastState);
-        break;
-      case SAVE:
-        run_save(lastState);
-        break;
-      case RESET:
-        run_reset(lastState);
-        break;
-    }
-    lastState = state;
-    FastLED.show();
   }
-
-
-
-
-  //if(SERIAL_EN){Serial.print(SERIAL_EN);}//probably how to do prints *cringes*
-
-
-
-
-
-
 }
