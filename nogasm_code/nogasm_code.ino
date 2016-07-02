@@ -420,7 +420,8 @@ uint8_t set_state(uint8_t btnState, uint8_t state){
         EEPROM.update(MAX_SPEED_ADDR, maxSpeed);
         //return OPT_RAMPSPD;
         //return OPT_BEEP;
-        analogWrite(MOTPIN, 0); //Turn the motor off for the white pressure monitoring mode
+        motSpeed = 0;
+        analogWrite(MOTPIN, motSpeed); //Turn the motor off for the white pressure monitoring mode
         return OPT_PRES; //Skip beep and rampspeed settings for now
       case OPT_RAMPSPD: //Not yet implimented
         //motSpeed = 0;
