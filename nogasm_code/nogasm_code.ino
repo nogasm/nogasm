@@ -108,7 +108,7 @@ int sensitivity = 0; //orgasm detection sensitivity, persists through different 
 uint8_t state = MANUAL;
 //=======Global Settings=============================
 //DIP switch options:
-bool SERIAL_EN =  false;
+uint8_t MOT_MAX =   179; //By default, motor speed only ever reaches 179. Alternative is 255
 bool SW2 =        false;
 bool SW3 =        false;
 bool SW4 =        false;
@@ -175,8 +175,13 @@ void setup() {
   delay(3000); // 3 second delay for recovery
 
   //If a pin reads low, the switch is enabled. Here, we read in the DIP settings
-  //Right now, only SW1 is used, for en/disabling serial. Though, it's enabled anyway
-  SERIAL_EN = (digitalRead(SW1PIN) == LOW);
+  //Right now, only SW1 is used, for enabling higher maximum motor speed.
+  if(digitalRead(SW1PIN)){
+    MOT_MAX = 179; //At the default low position, limit the motor speed
+  }
+  else{
+    MOT_MAX = 255; //When SW1 is flipped high, allow higher motor speeds
+  }
   SW2 = (digitalRead(SW2PIN) == LOW);
   SW3 = (digitalRead(SW3PIN) == LOW);
   SW4 = (digitalRead(SW4PIN) == LOW);
@@ -190,7 +195,7 @@ void setup() {
 
   //Recall saved settings from memory
   sensitivity = EEPROM.read(SENSITIVITY_ADDR);
-  maxSpeed = EEPROM.read(MAX_SPEED_ADDR);
+  maxSpeed = min(EEPROM.read(MAX_SPEED_ADDR),MOT_MAX); //Obey the MOT_MAX the first power  cycle after chaning it.
   beep_motor(1047,1396,2093); //Power on beep
 }
 
@@ -261,7 +266,7 @@ int encLimitRead(int minVal, int maxVal){
 void run_manual() {
   //In manual mode, only allow for 13 cursor positions, for adjusting motor speed.
   int knob = encLimitRead(0,12);
-  motSpeed = map(knob, 0, 12, 0., 255.);
+  motSpeed = map(knob, 0, 12, 0., (float)MOT_MAX);
   analogWrite(MOTPIN, motSpeed);
 
   //gyrGraphDraw(avgPressure, 0, 4 * 3 * NUM_LEDS);
@@ -298,7 +303,7 @@ void run_auto() {
 void run_opt_speed() {
   Serial.println("speed settings");
   int knob = encLimitRead(0,12);
-  motSpeed = map(knob, 0, 12, 0., 255.);
+  motSpeed = map(knob, 0, 12, 0., (float)MOT_MAX);
   analogWrite(MOTPIN, motSpeed);
   maxSpeed = motSpeed; //Set the maximum ramp-up speed in automatic mode
   //Little animation to show ramping up on the LEDs
