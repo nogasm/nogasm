@@ -112,6 +112,7 @@ uint8_t MOT_MAX =   179; //By default, motor speed only ever reaches 179. Altern
 bool SW2 =        false;
 bool SW3 =        false;
 bool SW4 =        false;
+#define MOT_MIN 20  // Motor PWM minimum.  It needs a little more than this to start.
 
 CRGB leds[NUM_LEDS];
 
@@ -291,7 +292,11 @@ void run_auto() {
   else if (motSpeed < (float)maxSpeed) {
     motSpeed += motIncrement;
   }
-  analogWrite(MOTPIN, (int) motSpeed);
+  if (motSpeed > MOT_MIN) {
+    analogWrite(MOTPIN, (int) motSpeed);
+  } else {
+    analogWrite(MOTPIN, 0);
+  }
 
   int presDraw = map(constrain(pressure - avgPressure, 0, pLimit),0,pLimit,0,NUM_LEDS*3);
   draw_bars_3(presDraw, CRGB::Green,CRGB::Yellow,CRGB::Red);
